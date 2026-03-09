@@ -19,6 +19,78 @@ from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, D
 # 设置日志记录器
 logger = logging.getLogger(__name__)
 
+
+class _IncrementalCleaner:
+    """流式内容清洗器，实时过滤 <thinking> 等内部推理标签。"""
+
+    SUPPRESSED_TAGS = frozenset({
+        'thinking', 'thought', 'reflection',
+        'internal_monologue', 'reasoning', 'analysis', 'scratchpad'
+    })
+
+    def __init__(self):
+        self._buffer = ""
+        self._suppressing = False
+        self._suppress_tag = ""
+
+    def feed(self, text: str) -> str:
+        self._buffer += text
+        return self._process()
+
+    def _process(self) -> str:
+        output_parts = []
+
+        while self._buffer:
+            if self._suppressing:
+                close_tag = f'</{self._suppress_tag}>'
+                idx = self._buffer.lower().find(close_tag.lower())
+                if idx >= 0:
+                    self._buffer = self._buffer[idx + len(close_tag):]
+                    self._suppressing = False
+                    self._buffer = self._buffer.lstrip('\n\r')
+                else:
+                    self._buffer = ""
+                    break
+            else:
+                lang_match = re.search(r'<lang\s+primary="[^"]*"\s*/>\n*', self._buffer)
+                if lang_match:
+                    output_parts.append(self._buffer[:lang_match.start()])
+                    self._buffer = self._buffer[lang_match.end():]
+                    continue
+
+                earliest_match = None
+                earliest_tag = ""
+                for tag in self.SUPPRESSED_TAGS:
+                    m = re.search(f'<{tag}>', self._buffer, re.IGNORECASE)
+                    if m and (earliest_match is None or m.start() < earliest_match.start()):
+                        earliest_match = m
+                        earliest_tag = tag
+
+                if earliest_match:
+                    output_parts.append(self._buffer[:earliest_match.start()])
+                    self._suppressing = True
+                    self._suppress_tag = earliest_tag
+                    self._buffer = self._buffer[earliest_match.end():]
+                else:
+                    partial = re.search(r'<[a-zA-Z_][^>]*$', self._buffer)
+                    if partial:
+                        output_parts.append(self._buffer[:partial.start()])
+                        self._buffer = self._buffer[partial.start():]
+                        break
+                    else:
+                        output_parts.append(self._buffer)
+                        self._buffer = ""
+
+        return "".join(output_parts)
+
+    def flush(self) -> str:
+        if self._suppressing:
+            return ""
+        result = self._buffer
+        self._buffer = ""
+        return result
+
+
 class NotionAIProvider(BaseProvider):
     def __init__(self):
         self.scraper = cloudscraper.create_scraper()
@@ -42,9 +114,15 @@ class NotionAIProvider(BaseProvider):
             logger.info("会话预热成功。")
         except Exception as e:
             logger.error(f"会话预热失败: {e}", exc_info=True)
+
+    def _create_request_scraper(self):
+        scraper = cloudscraper.create_scraper()
+        scraper.cookies.update(self.scraper.cookies)
+        return scraper
             
-    async def _create_thread(self, thread_type: str) -> str:
+    async def _create_thread(self, thread_type: str, scraper=None) -> str:
         thread_id = str(uuid.uuid4())
+        request_scraper = scraper or self.scraper
         payload = {
             "requestId": str(uuid.uuid4()),
             "transactions": [{
@@ -67,7 +145,7 @@ class NotionAIProvider(BaseProvider):
         try:
             logger.info(f"正在创建新的对话线程 (type: {thread_type})...")
             response = await run_in_threadpool(
-                lambda: self.scraper.post(
+                lambda: request_scraper.post(
                     self.api_endpoints["saveTransactions"],
                     headers=self._prepare_headers(),
                     json=payload,
@@ -86,28 +164,31 @@ class NotionAIProvider(BaseProvider):
 
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
-            incremental_fragments: List[str] = []
             final_message: Optional[str] = None
-            
+            has_streamed = False
+
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
                 mapped_model = settings.MODEL_MAP.get(model_name, "anthropic-sonnet-alt")
-                
+
                 thread_type = "markdown-chat" if mapped_model.startswith("vertex-") else "workflow"
-                
-                thread_id = await self._create_thread(thread_type)
+
+                request_scraper = self._create_request_scraper()
+                thread_id = await self._create_thread(thread_type, scraper=request_scraper)
                 payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
                 headers = self._prepare_headers()
 
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
+                cleaner = _IncrementalCleaner()
+
                 def sync_stream_iterator():
                     try:
                         logger.info(f"请求 Notion AI URL: {self.api_endpoints['runInference']}")
                         logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
-                        
-                        response = self.scraper.post(
+
+                        response = request_scraper.post(
                             self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
                             timeout=settings.API_REQUEST_TIMEOUT
                         )
@@ -119,7 +200,7 @@ class NotionAIProvider(BaseProvider):
                         yield e
 
                 sync_gen = sync_stream_iterator()
-              
+
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
                     if line is None:
@@ -129,26 +210,36 @@ class NotionAIProvider(BaseProvider):
 
                     parsed_results = self._parse_ndjson_line_to_texts(line)
                     for text_type, content in parsed_results:
-                        if text_type == 'final':
+                        if text_type == 'incremental':
+                            cleaned = cleaner.feed(content)
+                            if cleaned:
+                                chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned)
+                                yield create_sse_data(chunk)
+                                has_streamed = True
+                        elif text_type == 'final':
                             final_message = content
-                        elif text_type == 'incremental':
-                            incremental_fragments.append(content)
-              
-                full_response = ""
-                if final_message:
-                    full_response = final_message
-                    logger.info(f"成功从 record-map 或 Gemini patch/event 中提取到最终消息。")
-                else:
-                    full_response = "".join(incremental_fragments)
-                    logger.info(f"使用拼接所有增量片段的方式获得最终消息。")
 
-                if full_response:
-                    cleaned_response = self._clean_content(full_response)
-                    logger.info(f"清洗后的最终响应: {cleaned_response}")
-                    chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
+                remaining = cleaner.flush()
+                if remaining:
+                    chunk = create_chat_completion_chunk(request_id, model_name, content=remaining)
                     yield create_sse_data(chunk)
-                else:
-                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
+                    has_streamed = True
+
+                if not has_streamed:
+                    if final_message:
+                        cleaned_response = self._clean_content(final_message)
+                        if cleaned_response:
+                            logger.info(f"使用最终消息作为回退响应。")
+                            chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
+                            yield create_sse_data(chunk)
+                        else:
+                            logger.warning("警告: 清洗后的最终响应为空，尝试使用原始内容。")
+                            fallback = re.sub(r'<(thinking|thought|reflection|reasoning|analysis|scratchpad|internal_monologue)>[\s\S]*?</\1>', '', final_message, flags=re.IGNORECASE).strip()
+                            if fallback:
+                                chunk = create_chat_completion_chunk(request_id, model_name, content=fallback)
+                                yield create_sse_data(chunk)
+                    else:
+                        logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -401,14 +492,17 @@ class NotionAIProvider(BaseProvider):
                             logger.info("从 'patch' (Claude/GPT-style) 中提取到完整内容。")
                             results.append(('final', content))
 
-            # 格式3: 处理record-map类型的数据
+            # 格式3: 处理record-map类型的数据（取最后一条有效AI消息）
             elif data.get("type") == "record-map" and "recordMap" in data:
                 record_map = data["recordMap"]
                 if "thread_message" in record_map:
+                    last_content = None
+                    last_step_type = None
                     for msg_id, msg_data in record_map["thread_message"].items():
                         value_data = msg_data.get("value", {}).get("value", {})
                         step = value_data.get("step", {})
-                        if not step: continue
+                        if not step:
+                            continue
 
                         content = ""
                         step_type = step.get("type")
@@ -422,11 +516,16 @@ class NotionAIProvider(BaseProvider):
                                     if isinstance(item, dict) and item.get("type") == "text":
                                         content = item.get("content", "")
                                         break
-                        
+
                         if content and isinstance(content, str):
-                            logger.info(f"从 record-map (type: {step_type}) 提取到最终内容。")
-                            results.append(('final', content))
-                            break 
+                            if content.strip() == "好的，我已理解上述系统指令，将严格遵循。":
+                                continue
+                            last_content = content
+                            last_step_type = step_type
+
+                    if last_content:
+                        logger.info(f"从 record-map (type: {last_step_type}) 提取到最终内容。")
+                        results.append(('final', last_content))
     
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"解析NDJSON行失败: {e} - Line: {line.decode('utf-8', errors='ignore')}")
