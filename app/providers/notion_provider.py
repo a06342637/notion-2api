@@ -333,43 +333,7 @@ class NotionAIProvider(BaseProvider):
             {"id": str(uuid.uuid4()), "type": "config", "value": config_value},
             {"id": str(uuid.uuid4()), "type": "context", "value": context_value}
         ]
-
-        system_parts = []
-        if settings.SYSTEM_PROMPT:
-            system_parts.append(settings.SYSTEM_PROMPT)
-
-        language_hints = {
-            "zh-CN": "请始终使用简体中文回复用户。",
-            "zh-TW": "請始終使用繁體中文回覆使用者。",
-            "en": "Always respond in English.",
-            "ja": "常に日本語で回答してください。",
-            "ko": "항상 한국어로 응답하세요.",
-        }
-
-        for msg in request_data.get("messages", []):
-            if msg.get("role") == "system":
-                system_parts.append(msg.get("content", ""))
-
-        if settings.LANGUAGE and settings.LANGUAGE in language_hints:
-            has_lang_instruction = any("语言" in p or "中文" in p or "language" in p.lower() for p in system_parts)
-            if not has_lang_instruction:
-                system_parts.append(language_hints[settings.LANGUAGE])
-
-        if system_parts:
-            system_text = "\n".join(part for part in system_parts if part)
-            transcript.append({
-                "id": str(uuid.uuid4()),
-                "type": "user",
-                "value": [[f"[System Instructions]\n{system_text}"]],
-                "userId": settings.NOTION_USER_ID,
-                "createdAt": datetime.now().astimezone().isoformat()
-            })
-            transcript.append({
-                "id": str(uuid.uuid4()),
-                "type": "agent-inference",
-                "value": [{"type": "text", "content": "好的，我已理解上述系统指令，将严格遵循。"}]
-            })
-
+      
         for msg in request_data.get("messages", []):
             if msg.get("role") == "user":
                 transcript.append({
@@ -518,8 +482,6 @@ class NotionAIProvider(BaseProvider):
                                         break
 
                         if content and isinstance(content, str):
-                            if content.strip() == "好的，我已理解上述系统指令，将严格遵循。":
-                                continue
                             last_content = content
                             last_step_type = step_type
 
