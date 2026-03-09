@@ -4,6 +4,7 @@ import time
 import logging
 import uuid
 import re
+import asyncio
 import cloudscraper
 from typing import Dict, Any, AsyncGenerator, List, Optional, Tuple
 from datetime import datetime
@@ -181,8 +182,6 @@ class NotionAIProvider(BaseProvider):
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
-                cleaner = _IncrementalCleaner()
-
                 def sync_stream_iterator():
                     try:
                         logger.info(f"请求 Notion AI URL: {self.api_endpoints['runInference']}")
@@ -200,46 +199,65 @@ class NotionAIProvider(BaseProvider):
                         yield e
 
                 sync_gen = sync_stream_iterator()
+                line_queue: asyncio.Queue = asyncio.Queue()
 
-                while True:
-                    line = await run_in_threadpool(lambda: next(sync_gen, None))
-                    if line is None:
-                        break
-                    if isinstance(line, Exception):
-                        raise line
+                async def _bg_reader():
+                    try:
+                        while True:
+                            item = await run_in_threadpool(lambda: next(sync_gen, None))
+                            await line_queue.put(item)
+                            if item is None:
+                                break
+                    except Exception as e:
+                        await line_queue.put(e)
+                        await line_queue.put(None)
 
-                    parsed_results = self._parse_ndjson_line_to_texts(line)
-                    for text_type, content in parsed_results:
-                        if text_type == 'incremental':
-                            cleaned = cleaner.feed(content)
-                            if cleaned:
-                                chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned)
-                                yield create_sse_data(chunk)
-                                has_streamed = True
-                        elif text_type == 'final':
-                            final_message = content
+                reader_task = asyncio.create_task(_bg_reader())
+                incremental_fragments: List[str] = []
 
-                remaining = cleaner.flush()
-                if remaining:
-                    chunk = create_chat_completion_chunk(request_id, model_name, content=remaining)
-                    yield create_sse_data(chunk)
-                    has_streamed = True
+                try:
+                    while True:
+                        try:
+                            line = await asyncio.wait_for(line_queue.get(), timeout=15.0)
+                        except asyncio.TimeoutError:
+                            yield b": heartbeat\n\n"
+                            continue
 
-                if not has_streamed:
-                    if final_message:
-                        cleaned_response = self._clean_content(final_message)
-                        if cleaned_response:
-                            logger.info(f"使用最终消息作为回退响应。")
-                            chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
-                            yield create_sse_data(chunk)
-                        else:
-                            logger.warning("警告: 清洗后的最终响应为空，尝试使用原始内容。")
-                            fallback = re.sub(r'<(thinking|thought|reflection|reasoning|analysis|scratchpad|internal_monologue)>[\s\S]*?</\1>', '', final_message, flags=re.IGNORECASE).strip()
-                            if fallback:
-                                chunk = create_chat_completion_chunk(request_id, model_name, content=fallback)
-                                yield create_sse_data(chunk)
+                        if line is None:
+                            break
+                        if isinstance(line, Exception):
+                            raise line
+
+                        parsed_results = self._parse_ndjson_line_to_texts(line)
+                        for text_type, content in parsed_results:
+                            if text_type == 'incremental':
+                                incremental_fragments.append(content)
+                            elif text_type == 'final':
+                                final_message = content
+                finally:
+                    if not reader_task.done():
+                        reader_task.cancel()
+                        try:
+                            await reader_task
+                        except asyncio.CancelledError:
+                            pass
+
+                full_response = final_message if final_message else "".join(incremental_fragments)
+
+                if full_response:
+                    cleaned_response = self._clean_content(full_response)
+                    if cleaned_response:
+                        logger.info(f"清洗后响应长度: {len(cleaned_response)}")
+                        chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
+                        yield create_sse_data(chunk)
                     else:
-                        logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
+                        logger.warning("警告: 清洗后为空，使用原始内容回退。")
+                        fallback = re.sub(r'<(thinking|thought|reflection|reasoning|analysis|scratchpad|internal_monologue)>[\s\S]*?</\1>', '', full_response, flags=re.IGNORECASE).strip()
+                        if fallback:
+                            chunk = create_chat_completion_chunk(request_id, model_name, content=fallback)
+                            yield create_sse_data(chunk)
+                else:
+                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -399,8 +417,25 @@ class NotionAIProvider(BaseProvider):
         for pattern in reasoning_patterns:
             content = re.sub(r'^[\s]*' + pattern, '', content, flags=re.IGNORECASE | re.MULTILINE)
 
+        chinese_reasoning_patterns = [
+            r'用?户(?:说|问)了?\s*[「"\'"\s].*?[。.]\s*',
+            r'(?:意思是|也就是说)[「"\'"]?.*?[。.]\s*',
+            r'(?:但是?|不过)用户(?:之前|之后|还没|并没|只是)[^。\n]*[。.]\s*',
+            r'现在用户(?:要求|想要|需要|希望)[^。\n]*[。.]\s*',
+            r'我(?:应该|需要|不需要)[^。\n]*?(?:回[答复]|告诉|响应|使用|输出|直接)[^。\n]*[。.]\s*',
+            r'根据(?:语言指南|系统提示|上述指令|指示)[，,]?[^。\n]*[。.]?\s*',
+            r'这是一个(?:关于|简单|直接|基本|一般性)[^。\n]*?(?:的问题|的请求|的查询)[^。\n]*[。.]\s*',
+            r'(?:我)?不需要使用任何(?:工具|tools?)[^。\n]*[。.]\s*',
+            r'(?:我可以|这(?:是|个)我?可以?)直接(?:回答|回复)[^。\n]*[。.]\s*',
+            r'[，,]\s*(?:并|然后)(?:询问|回[答复])(?:他们?|用户)[^。\n]*[。.]\s*',
+        ]
+
+        for pattern in chinese_reasoning_patterns:
+            content = re.sub(pattern, '', content, flags=re.MULTILINE)
+
+        content = re.sub(r'\s*primary\s*', '', content)
         content = re.sub(r'^\s*\n', '', content)
-        
+
         return content.strip()
 
     def _parse_ndjson_line_to_texts(self, line: bytes) -> List[Tuple[str, str]]:
