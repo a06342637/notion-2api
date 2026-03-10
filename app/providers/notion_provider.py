@@ -4,6 +4,7 @@ import time
 import logging
 import uuid
 import re
+import asyncio
 import cloudscraper
 from typing import Dict, Any, AsyncGenerator, List, Optional, Tuple
 from datetime import datetime
@@ -203,33 +204,60 @@ class NotionAIProvider(BaseProvider):
                         yield e
 
                 sync_gen = sync_stream_iterator()
+                line_queue: asyncio.Queue = asyncio.Queue()
 
-                while True:
-                    line = await run_in_threadpool(lambda: next(sync_gen, None))
-                    if line is None:
-                        break
-                    if isinstance(line, Exception):
-                        raise line
+                async def _bg_reader():
+                    try:
+                        while True:
+                            item = await run_in_threadpool(lambda: next(sync_gen, None))
+                            await line_queue.put(item)
+                            if item is None:
+                                break
+                    except Exception as e:
+                        await line_queue.put(e)
+                        await line_queue.put(None)
 
-                    parsed_results = self._parse_ndjson_line_to_texts(line)
-                    for text_type, content in parsed_results:
-                        if text_type == 'incremental':
-                            if not prefix_flushed:
-                                prefix_parts.append(content)
-                                prefix_len += len(content)
-                                if prefix_len >= PREFIX_MAX:
-                                    cleaned_prefix = self._clean_content("".join(prefix_parts))
-                                    if cleaned_prefix:
-                                        chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_prefix)
+                reader_task = asyncio.create_task(_bg_reader())
+
+                try:
+                    while True:
+                        try:
+                            line = await asyncio.wait_for(line_queue.get(), timeout=15.0)
+                        except asyncio.TimeoutError:
+                            yield b": heartbeat\n\n"
+                            continue
+
+                        if line is None:
+                            break
+                        if isinstance(line, Exception):
+                            raise line
+
+                        parsed_results = self._parse_ndjson_line_to_texts(line)
+                        for text_type, content in parsed_results:
+                            if text_type == 'incremental':
+                                if not prefix_flushed:
+                                    prefix_parts.append(content)
+                                    prefix_len += len(content)
+                                    if prefix_len >= PREFIX_MAX:
+                                        cleaned_prefix = self._clean_content("".join(prefix_parts))
+                                        if cleaned_prefix:
+                                            chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_prefix)
+                                            yield create_sse_data(chunk)
+                                        prefix_flushed = True
+                                else:
+                                    cleaned = cleaner.feed(content)
+                                    if cleaned:
+                                        chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned)
                                         yield create_sse_data(chunk)
-                                    prefix_flushed = True
-                            else:
-                                cleaned = cleaner.feed(content)
-                                if cleaned:
-                                    chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned)
-                                    yield create_sse_data(chunk)
-                        elif text_type == 'final':
-                            final_message = content
+                            elif text_type == 'final':
+                                final_message = content
+                finally:
+                    if not reader_task.done():
+                        reader_task.cancel()
+                        try:
+                            await reader_task
+                        except asyncio.CancelledError:
+                            pass
 
                 if not prefix_flushed:
                     text = "".join(prefix_parts) if prefix_parts else (final_message or "")
