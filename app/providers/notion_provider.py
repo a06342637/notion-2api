@@ -4,7 +4,6 @@ import time
 import logging
 import uuid
 import re
-import asyncio
 import cloudscraper
 from typing import Dict, Any, AsyncGenerator, List, Optional, Tuple
 from datetime import datetime
@@ -166,7 +165,6 @@ class NotionAIProvider(BaseProvider):
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
             final_message: Optional[str] = None
-            has_streamed = False
 
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
@@ -181,6 +179,12 @@ class NotionAIProvider(BaseProvider):
 
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
+
+                cleaner = _IncrementalCleaner()
+                PREFIX_MAX = 2000
+                prefix_parts: List[str] = []
+                prefix_len = 0
+                prefix_flushed = False
 
                 def sync_stream_iterator():
                     try:
@@ -199,65 +203,53 @@ class NotionAIProvider(BaseProvider):
                         yield e
 
                 sync_gen = sync_stream_iterator()
-                line_queue: asyncio.Queue = asyncio.Queue()
 
-                async def _bg_reader():
-                    try:
-                        while True:
-                            item = await run_in_threadpool(lambda: next(sync_gen, None))
-                            await line_queue.put(item)
-                            if item is None:
-                                break
-                    except Exception as e:
-                        await line_queue.put(e)
-                        await line_queue.put(None)
+                while True:
+                    line = await run_in_threadpool(lambda: next(sync_gen, None))
+                    if line is None:
+                        break
+                    if isinstance(line, Exception):
+                        raise line
 
-                reader_task = asyncio.create_task(_bg_reader())
-                incremental_fragments: List[str] = []
+                    parsed_results = self._parse_ndjson_line_to_texts(line)
+                    for text_type, content in parsed_results:
+                        if text_type == 'incremental':
+                            if not prefix_flushed:
+                                prefix_parts.append(content)
+                                prefix_len += len(content)
+                                if prefix_len >= PREFIX_MAX:
+                                    cleaned_prefix = self._clean_content("".join(prefix_parts))
+                                    if cleaned_prefix:
+                                        chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_prefix)
+                                        yield create_sse_data(chunk)
+                                    prefix_flushed = True
+                            else:
+                                cleaned = cleaner.feed(content)
+                                if cleaned:
+                                    chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned)
+                                    yield create_sse_data(chunk)
+                        elif text_type == 'final':
+                            final_message = content
 
-                try:
-                    while True:
-                        try:
-                            line = await asyncio.wait_for(line_queue.get(), timeout=15.0)
-                        except asyncio.TimeoutError:
-                            yield b": heartbeat\n\n"
-                            continue
-
-                        if line is None:
-                            break
-                        if isinstance(line, Exception):
-                            raise line
-
-                        parsed_results = self._parse_ndjson_line_to_texts(line)
-                        for text_type, content in parsed_results:
-                            if text_type == 'incremental':
-                                incremental_fragments.append(content)
-                            elif text_type == 'final':
-                                final_message = content
-                finally:
-                    if not reader_task.done():
-                        reader_task.cancel()
-                        try:
-                            await reader_task
-                        except asyncio.CancelledError:
-                            pass
-
-                full_response = final_message if final_message else "".join(incremental_fragments)
-
-                if full_response:
-                    cleaned_response = self._clean_content(full_response)
-                    if cleaned_response:
-                        logger.info(f"清洗后响应长度: {len(cleaned_response)}")
-                        chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
-                        yield create_sse_data(chunk)
-                    else:
-                        logger.warning("警告: 清洗后为空，使用原始内容回退。")
-                        fallback = re.sub(r'<(thinking|thought|reflection|reasoning|analysis|scratchpad|internal_monologue)>[\s\S]*?</\1>', '', full_response, flags=re.IGNORECASE).strip()
-                        if fallback:
-                            chunk = create_chat_completion_chunk(request_id, model_name, content=fallback)
+                if not prefix_flushed:
+                    text = "".join(prefix_parts) if prefix_parts else (final_message or "")
+                    if text:
+                        cleaned_response = self._clean_content(text)
+                        if cleaned_response:
+                            chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
                             yield create_sse_data(chunk)
+                        else:
+                            fallback = re.sub(r'<(thinking|thought|reflection|reasoning|analysis|scratchpad|internal_monologue)>[\s\S]*?</\1>', '', text, flags=re.IGNORECASE).strip()
+                            if fallback:
+                                chunk = create_chat_completion_chunk(request_id, model_name, content=fallback)
+                                yield create_sse_data(chunk)
+                    elif not final_message:
+                        logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。")
                 else:
-                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
+                    remaining = cleaner.flush()
+                    if remaining:
+                        chunk = create_chat_completion_chunk(request_id, model_name, content=remaining)
+                        yield create_sse_data(chunk)
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
