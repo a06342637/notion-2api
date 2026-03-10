@@ -222,8 +222,9 @@ class NotionAIProvider(BaseProvider):
                 try:
                     while True:
                         try:
-                            line = await asyncio.wait_for(line_queue.get(), timeout=15.0)
+                            line = await asyncio.wait_for(line_queue.get(), timeout=5.0)
                         except asyncio.TimeoutError:
+                            logger.debug("发送心跳保活")
                             yield b": heartbeat\n\n"
                             continue
 
@@ -291,7 +292,11 @@ class NotionAIProvider(BaseProvider):
                 yield DONE_CHUNK
 
         if stream:
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            headers = {
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            }
+            return StreamingResponse(stream_generator(), media_type="text/event-stream", headers=headers)
         else:
             raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
 
